@@ -58,7 +58,7 @@ fun parseAssignments(title: String, books: List<Book>): List<ReadingGroup> {
 }
 
 fun groupLabel(group: ReadingGroup, books: List<Book>): String {
-    val book = books.first { it.id == group.bookId }
+    val book = books.firstOrNull { it.id == group.bookId } ?: return "Scriptures"
     val runs = mutableListOf<String>()
     val chapters = group.chapters
     var index = 0

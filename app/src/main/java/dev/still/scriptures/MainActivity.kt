@@ -127,7 +127,7 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
             val hasPosition = store.position() != null || lastLesson != null
             val daily = current?.let { dailyVerse(it, today) }
             WatchList {
-                item { Heading("STILL", "Scriptures") }
+                item { Heading("SMALL EDITION", "Thumbscript") }
                 item {
                     MenuChip(if (hasPosition) "Continue reading" else "Start reading",
                         lastLesson?.let { "Lesson · ${it.title}" } ?: books.first { it.id == position.bookId }.reference(position.chapter, position.verse)) {
@@ -136,9 +136,10 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
                 }
                 item { MenuChip("Go to scripture", "Book · chapter · verse") { navigation.navigate("volume") } }
                 item { MenuChip("Come, Follow Me", current?.title ?: "Browse saved lessons") { navigation.navigate("cfm") } }
-                item { MenuChip("Scripture of the day", daily?.let { books.first { b -> b.id == it.bookId }.reference(it.chapter, it.verse) } ?: "Selection unavailable") {
-                    if (daily != null) open(daily.position()) else navigation.navigate("cfm")
-                } }
+                item { val dailyBook = daily?.let { d -> books.firstOrNull { b -> b.id == d.bookId } }
+                    MenuChip("Scripture of the day", if (daily != null && dailyBook != null) dailyBook.reference(daily.chapter, daily.verse) else "Selection unavailable") {
+                        if (daily != null && dailyBook != null) open(daily.position()) else navigation.navigate("cfm")
+                    } }
                 item { MenuChip("Flip open", "Find a random verse") { navigation.navigate("flip-scope") } }
                 item { MenuChip("Saved verses", "${savedVerses.size} saved on this watch") { navigation.navigate("saved") } }
                 item { MenuChip("Reading settings", "Text size · screen") { navigation.navigate("settings") } }

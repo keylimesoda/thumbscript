@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/images/app-icon.svg" width="112" height="112" alt="Still Scriptures open-book app icon" />
+  <img src="docs/images/app-icon.svg" width="112" height="112" alt="Thumbscript open-book app icon" />
 </p>
 
-<h1 align="center">Still Scriptures</h1>
+<h1 align="center">Thumbscript</h1>
 
 <p align="center">
   <strong>A quiet way to end the day.</strong><br />
@@ -25,7 +25,7 @@
 
 Open your watch. Choose a passage. Turn the bezel and read.
 
-**Still Scriptures** is a small, standalone Wear OS app built around bedtime
+**Thumbscript** is a small, standalone Wear OS app built around bedtime
 reading on a Galaxy Watch 6 Classic: a black screen, warm serif text, and the
 whole chapter when you want to keep going. Your phone can stay on the nightstand.
 
@@ -47,7 +47,7 @@ whole chapter when you want to keep going. Your phone can stay on the nightstand
 <table>
   <tr>
     <td align="center" width="50%"><img src="docs/images/flip-open.png" width="220" alt="An open book with turning pages in the random scripture experience" /></td>
-    <td align="center" width="50%"><img src="docs/images/home.png" width="220" alt="Still Scriptures home menu with Continue reading and Go to scripture" /></td>
+    <td align="center" width="50%"><img src="docs/images/home.png" width="220" alt="Thumbscript home menu with Continue reading and Go to scripture" /></td>
   </tr>
   <tr>
     <td align="center"><strong>Let the pages find a passage</strong><br /><sub>Turn the bezel. Stop. See where you land.</sub></td>
