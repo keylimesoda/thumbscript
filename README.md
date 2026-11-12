@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/keylimesoda/still-scriptures/releases/tag/v0.6.1"><strong>Download the watch app</strong></a>
+  <a href="https://github.com/keylimesoda/thumbscript/releases/tag/v0.6.1"><strong>Download the watch app</strong></a>
   &nbsp;·&nbsp; <a href="#take-a-look">See the app</a>
   &nbsp;·&nbsp; <a href="#install">Installation guide</a>
 </p>
@@ -132,7 +132,9 @@ for its account sync. A portable backup of watch saves remains future work.
 
 ## Install
 
-Download the optimized **release APK** from [the latest preview](https://github.com/keylimesoda/still-scriptures/releases/tag/v0.6.1).
+Automated signed GitHub APK publishing and one-time signing-key setup are documented in [`docs/RELEASING.md`](docs/RELEASING.md).
+
+Download the optimized **release APK** from [the latest preview](https://github.com/keylimesoda/thumbscript/releases/tag/v0.6.1).
 Enable Developer options and Wireless debugging on the watch; keep it and your
 computer on the same Wi-Fi. Use Android platform tools:
 
