@@ -1,63 +1,221 @@
 name: Publish signed Wear OS APK
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable vX.Y.Z tag at a reviewed commit on main
+        required: true
+        type: string
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: apk-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
-      contents: write
-    env:
-      ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/release.jks
-      ANDROID_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-      ANDROID_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-      ANDROID_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      contents: read
+    outputs:
+      commit: ${{ steps.gate.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check tag, version and main ancestry without running project code
+        id: gate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          workflow_commit=$(git rev-parse HEAD)
+          main_commit=$(git rev-parse refs/remotes/origin/main)
+          [[ "$workflow_commit" == "$GITHUB_SHA" && "$workflow_commit" == "$main_commit" ]] || {
+            echo 'Dispatch from the current protected main commit' >&2; exit 1;
+          }
+          tag_commit=$(git rev-parse --verify "${RELEASE_TAG}^{commit}")
+          git merge-base --is-ancestor "$tag_commit" "$main_commit"
+          workflow_path=.github/workflows/release-apk.yml
+          [[ "$(git rev-parse "$tag_commit:$workflow_path")" == "$(git rev-parse "$workflow_commit:$workflow_path")" ]] || {
+            echo 'Release tag must contain the exact reviewed main workflow' >&2; exit 1;
+          }
+          export TAG_COMMIT="$tag_commit"
+          python3 - <<'PY'
+          import os, re
+          import subprocess
+          source = subprocess.run(
+              ['git', 'show', f"{os.environ['TAG_COMMIT']}:app/build.gradle.kts"],
+              check=True, capture_output=True, text=True,
+          ).stdout
+          versions = re.findall(r'^\s*versionName = "([^"]+)"\s*$', source, re.M)
+          if len(versions) != 1 or os.environ['RELEASE_TAG'] != 'v' + versions[0]:
+              raise SystemExit('Tag must exactly match the single literal app versionName')
+          PY
+          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - name: Install Android build tools
-        run: sdkmanager "build-tools;35.0.0"
-      - name: Validate signing secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          app_version="$(sed -n 's/^[[:space:]]*versionName = "\([^"]*\)".*/\1/p' app/build.gradle.kts | head -1)"
-          if [[ "$tag_version" != "$app_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match app versionName $app_version" >&2; exit 1
-          fi
-          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
-            if [[ -z "${!name:-}" ]]; then echo "Missing GitHub Actions secret for $name" >&2; exit 1; fi
-          done
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_FILE"
-          chmod 600 "$ANDROID_KEYSTORE_FILE"
-      - name: Build signed release APK
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
-      - name: Verify signature and create checksum
-        shell: bash
-        run: |
-          set -euo pipefail
-          APK=app/build/outputs/apk/release/app-release.apk
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
-          mv "$APK" "Thumbscript-${GITHUB_REF_NAME}.apk"
-          sha256sum "Thumbscript-${GITHUB_REF_NAME}.apk" > SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - name: Build unsigned optimized APK without signing secrets
+        env:
+          RELEASE_UNSIGNED: 'true'
+        run: bash ./gradlew :app:assembleRelease --no-daemon
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: Thumbscript ${{ github.ref_name }}
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
-          make_latest: ${{ !contains(github.ref_name, '-') }}
-          files: |
-            Thumbscript-${{ github.ref_name }}.apk
-            SHA256SUMS.txt
+          name: unsigned-apk
+          path: app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release-signing
+    permissions:
+      actions: read
+    steps:
+      # No checkout or project code in the signing job.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-apk
+          path: incoming
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install signing tools before exposing secrets
+        run: |
+          set -euo pipefail
+          sdk_root=""
+          for candidate in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
+            [[ -n "$candidate" ]] || continue
+            if [[ -x "$candidate/cmdline-tools/latest/bin/sdkmanager" ]]; then
+              sdk_root="$candidate"
+              break
+            fi
+          done
+          [[ -n "$sdk_root" ]] || { echo 'Android SDK manager missing on runner' >&2; exit 1; }
+          printf '%s\n' "ANDROID_HOME=$sdk_root" "ANDROID_SDK_ROOT=$sdk_root" >> "$GITHUB_ENV"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk_root" 'build-tools;35.0.0'
+          for tool in aapt zipalign apksigner; do
+            [[ -x "$sdk_root/build-tools/35.0.0/$tool" ]] || {
+              echo "Android build tool missing: $tool" >&2; exit 1;
+            }
+          done
+      - name: Sign APK and verify public certificate identity
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          # Public v0.6.1 signer; changing keys requires a reviewed migration.
+          EXPECTED_SIGNER_SHA256: 1556e4db1f0958784731d64f0ca2b2c76a4da3764c9942558bef715ebb9fd66d
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$key"' EXIT
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            [[ -n "${!name:-}" ]] || { echo "Missing signing configuration: $name" >&2; exit 1; }
+          done
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          apk=incoming/app-release-unsigned.apk
+          [[ -f "$apk" && ! -L "$apk" ]]
+          actual_version=$("$tools/aapt" dump badging "$apk" | sed -n "s/^package: .*versionName='\([^']*\)'.*/\1/p")
+          [[ "v$actual_version" == "$RELEASE_TAG" ]]
+          mkdir -p outgoing
+          output="outgoing/Thumbscript-${RELEASE_TAG}.apk"
+          "$tools/zipalign" -p -f 4 "$apk" "$RUNNER_TEMP/aligned.apk"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$key"
+          unset ANDROID_KEYSTORE_BASE64
+          "$tools/apksigner" sign --ks "$key" --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD \
+            --out "$output" "$RUNNER_TEMP/aligned.apk"
+          unset ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD ANDROID_KEY_ALIAS
+          "$tools/apksigner" verify --print-certs "$output" > "$RUNNER_TEMP/certificate.txt"
+          mapfile -t signers < <(sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: //p' "$RUNNER_TEMP/certificate.txt")
+          [[ ${#signers[@]} == 1 && "${signers[0]}" == "$EXPECTED_SIGNER_SHA256" ]] || {
+            echo 'APK signer does not match the reviewed public fingerprint' >&2; exit 1;
+          }
+          (cd outgoing && sha256sum "Thumbscript-${RELEASE_TAG}.apk" > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-apk
+          path: |
+            outgoing/Thumbscript-*.apk
+            outgoing/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [preflight, sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release-publish
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      # Download only this run's verified output; execute no repository code.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-apk
+          path: outgoing
+      - name: Create a new release only after all gates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          current=$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)
+          [[ "$current" == "$RELEASE_COMMIT" ]]
+          cd outgoing
+          expected_apk="Thumbscript-${RELEASE_TAG}.apk"
+          shopt -s nullglob dotglob
+          files=( * )
+          [[ ${#files[@]} == 2 ]]
+          for file in "${files[@]}"; do
+            [[ -f "$file" && ! -L "$file" ]]
+          done
+          [[ -f "$expected_apk" && ! -L "$expected_apk" ]]
+          [[ -f SHA256SUMS.txt && ! -L SHA256SUMS.txt ]]
+          mapfile -t manifest < SHA256SUMS.txt
+          [[ ${#manifest[@]} == 1 ]]
+          read -r digest filename extra <<< "${manifest[0]}"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ && "$filename" == "$expected_apk" && -z "${extra:-}" ]]
+          actual_digest=$(sha256sum -- "$expected_apk" | cut -d' ' -f1)
+          [[ "$actual_digest" == "$digest" ]]
+          args=(--verify-tag --title "Thumbscript $RELEASE_TAG" --generate-notes --latest=false)
+          if [[ "$RELEASE_TAG" == *-* ]]; then args+=(--prerelease); fi
+          # gh release create rejects an existing release; never upload/clobber assets.
+          gh release create "$RELEASE_TAG" "Thumbscript-${RELEASE_TAG}.apk" SHA256SUMS.txt "${args[@]}"
