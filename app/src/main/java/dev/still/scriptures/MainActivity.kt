@@ -1,6 +1,8 @@
 package dev.still.scriptures
 
+import android.app.ActivityManager
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -45,10 +47,13 @@ import androidx.wear.compose.material.*
 import androidx.wear.compose.navigation.SwipeDismissableNavHost
 import androidx.wear.compose.navigation.composable
 import androidx.wear.compose.navigation.rememberSwipeDismissableNavController
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.ZonedDateTime
 
@@ -68,41 +73,66 @@ class MainActivity : ComponentActivity() {
                 primary = Accent, onPrimary = Color.Black, background = Color.Black,
                 onBackground = Ink, surface = Surface, onSurface = Ink,
             )) {
-                var books by remember { mutableStateOf<List<Book>?>(null) }
+                var books by remember { mutableStateOf(repository.cachedCatalog()) }
                 var error by remember { mutableStateOf(false) }
-                var lessons by remember { mutableStateOf<List<Lesson>>(emptyList()) }
+                var retry by remember { mutableIntStateOf(0) }
                 LaunchedEffect(Unit) {
+                    withContext(Dispatchers.IO) { logLastExitReason() }
+                }
+                LaunchedEffect(retry) {
+                    if (books != null) return@LaunchedEffect
+                    error = false
                     try {
-                        val catalog = repository.catalog()
-                        lessons = runCatching { lessonRepository.load() }.getOrDefault(emptyList())
-                        books = catalog
-                    } catch (_: Exception) { error = true }
+                        books = repository.catalog()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        Log.e("Thumbscript", "Failed to load scripture catalog", failure)
+                        error = true
+                    }
                 }
                 Box(Modifier.fillMaxSize().background(Color.Black)) {
-                    if (error) Message("Unable to open the library. Please reinstall the app.")
-                    else if (books == null) Message("Opening scriptures…")
-                    else ScriptureApp(books!!, repository, lessonRepository, lessons, store, this@MainActivity)
+                    if (error) {
+                        WatchList {
+                            item { Text("Unable to open the library.", color = Ink, fontSize = 14.sp, textAlign = TextAlign.Center) }
+                            item { MenuChip("Try again") { retry++ } }
+                        }
+                    } else if (books == null) Message("Opening scriptures…")
+                    else ScriptureApp(books!!, repository, lessonRepository, store, this@MainActivity)
                 }
             }
+        }
+    }
+
+    private fun logLastExitReason() {
+        runCatching {
+            val manager = getSystemService(ActivityManager::class.java) ?: return
+            val last = manager.getHistoricalProcessExitReasons(packageName, 0, 1).firstOrNull() ?: return
+            Log.i("Thumbscript", "Last process exit: reason=${last.reason} status=${last.status} desc=${last.description}")
         }
     }
 }
 
 @Composable
 private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, lessonRepository: LessonRepository,
-                         initialLessons: List<Lesson>, store: ReadingStore, activity: MainActivity) {
+                         store: ReadingStore, activity: MainActivity) {
     val navigation = rememberSwipeDismissableNavController()
     val studyRepository = remember { StudyRepository(activity) }
     val volumes = remember(books) { books.map { it.volume }.distinct() }
     var textSize by remember { mutableIntStateOf(store.textSize) }
     var keepAwake by remember { mutableStateOf(store.keepAwake) }
     var savedVerses by remember { mutableStateOf(store.savedVerses().filter { validVerse(it, books) }) }
-    var lessons by remember { mutableStateOf(initialLessons) }
+    var lessons by remember { mutableStateOf<List<Lesson>>(emptyList()) }
+    var lessonsLoading by remember { mutableStateOf(true) }
     var refreshing by remember { mutableStateOf(false) }
     var refreshError by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val today = rememberLocalDate()
     val current = lessonForDate(lessons, today)
+    LaunchedEffect(Unit) {
+        lessons = runCatching { lessonRepository.load() }.getOrDefault(emptyList())
+        lessonsLoading = false
+    }
     fun refreshCalendar(year: Int) {
         if (refreshing) return
         refreshing = true; refreshError = false
@@ -146,40 +176,46 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
             }
         }
         composable("volume") {
-            Wheel("SCRIPTURES", volumes, volumes.indexOf(books.first { it.id == last().bookId }.volume), "Choose reference") {
+            val initialVolume = volumes.indexOf(books.firstOrNull { it.id == last().bookId }?.volume).coerceAtLeast(0)
+            Wheel("SCRIPTURES", volumes, initialVolume, "Choose reference") {
                 navigation.navigate("reference/$it")
             }
         }
         composable("reference/{volume}", arguments = listOf(navArgument("volume") { type = NavType.IntType })) { entry ->
-            val volume = volumes[entry.arguments!!.getInt("volume")]
+            val volume = volumes.getOrNull(entry.arguments?.getInt("volume") ?: -1)
+            if (volume == null) { Message("Choose a volume from the menu."); return@composable }
             val options = books.filter { it.volume == volume }
+            if (options.isEmpty()) { Message("Choose a volume from the menu."); return@composable }
             ReferencePicker(volume, options, last()) { open(it) }
         }
         composable("reader/{book}/{chapter}/{verse}/{resume}", arguments = listOf(
             navArgument("chapter") { type = NavType.IntType }, navArgument("verse") { type = NavType.IntType },
             navArgument("resume") { type = NavType.BoolType },
         )) { entry ->
-            val args = entry.arguments!!
-            val requested = ReadingPosition(args.getString("book")!!, args.getInt("chapter"), args.getInt("verse"))
-            val saved = store.position()?.takeIf { args.getBoolean("resume") && it.bookId == requested.bookId && it.chapter == requested.chapter }
+            val args = entry.arguments
+            val requested = ReadingPosition(args?.getString("book").orEmpty(), args?.getInt("chapter") ?: 1, args?.getInt("verse") ?: 1)
+            val saved = store.position()?.takeIf { args?.getBoolean("resume") == true && it.bookId == requested.bookId && it.chapter == requested.chapter }
             val initial = normalizePosition(saved ?: requested, books)
             val next = nextChapter(books, initial)
             Reader(books.first { it.id == initial.bookId }, initial, repository, studyRepository, store, textSize, keepAwake, activity,
                 savedKeys = savedVerses.map(::verseKey).toSet(),
                 onVerse = { navigation.navigate("verse-actions/${it.bookId}/${it.chapter}/${it.verse}") },
                 onSettings = { navigation.navigate("settings") },
-                nextLabel = next?.let { books.first { book -> book.id == it.bookId }.reference(it.chapter) },
+                nextLabel = next?.let { books.firstOrNull { book -> book.id == it.bookId }?.reference(it.chapter) },
                 onNext = { next?.let { open(it, parent = "reader/{book}/{chapter}/{verse}/{resume}") } })
         }
         composable("flip-scope") {
-            Wheel("CHOOSE SCRIPTURES", volumes, volumes.indexOf(books.first { it.id == last().bookId }.volume), "Flip pages") {
+            val initialVolume = volumes.indexOf(books.firstOrNull { it.id == last().bookId }?.volume).coerceAtLeast(0)
+            Wheel("CHOOSE SCRIPTURES", volumes, initialVolume, "Flip pages") {
                 navigation.navigate("flip/$it")
             }
         }
         composable("flip/{scope}", arguments = listOf(navArgument("scope") { type = NavType.IntType })) { entry ->
-            val selectedScope = entry.arguments!!.getInt("scope")
-            val pool = books.filter { it.volume == volumes[selectedScope] }
-            PageFlipReader(volumes[selectedScope], pool) { open(it) }
+            val volume = volumes.getOrNull(entry.arguments?.getInt("scope") ?: -1)
+            if (volume == null) { Message("Choose a volume from the menu."); return@composable }
+            val pool = books.filter { it.volume == volume }
+            if (pool.isEmpty()) { Message("Choose a volume from the menu."); return@composable }
+            PageFlipReader(volume, pool) { open(it) }
         }
         composable("saved") {
             WatchList {
@@ -187,17 +223,21 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
                 if (savedVerses.isEmpty()) item { Text("Tap a verse while reading, then choose Save verse. It stays on this watch.",
                     color = Muted, fontSize = 14.sp, textAlign = TextAlign.Center) }
                 savedVerses.forEach { position ->
-                    item { MenuChip(books.first { it.id == position.bookId }.reference(position.chapter, position.verse), "Read in its chapter") {
-                        open(position, parent = "saved")
-                    } }
+                    val savedBook = books.firstOrNull { it.id == position.bookId }
+                    if (savedBook != null) {
+                        item { MenuChip(savedBook.reference(position.chapter, position.verse), "Read in its chapter") {
+                            open(position, parent = "saved")
+                        } }
+                    }
                 }
             }
         }
         composable("verse-actions/{book}/{chapter}/{verse}", arguments = listOf(
             navArgument("chapter") { type = NavType.IntType }, navArgument("verse") { type = NavType.IntType })) { entry ->
-            val args = entry.arguments!!
-            val position = ReadingPosition(args.getString("book")!!, args.getInt("chapter"), args.getInt("verse"))
-            val book = books.first { it.id == position.bookId }
+            val args = entry.arguments
+            val position = ReadingPosition(args?.getString("book").orEmpty(), args?.getInt("chapter") ?: 1, args?.getInt("verse") ?: 1)
+            val book = books.firstOrNull { it.id == position.bookId }
+            if (book == null) { Message("Verse unavailable."); return@composable }
             LaunchedEffect(book.id, position.chapter) { studyRepository.cached(book, position.chapter) }
             val study = studyRepository.memory["${book.id}-${position.chapter}"]
             val notes = study?.notes?.filter { it.verse == position.verse }
@@ -220,9 +260,10 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
         }
         composable("footnotes/{book}/{chapter}/{verse}", arguments = listOf(
             navArgument("chapter") { type = NavType.IntType }, navArgument("verse") { type = NavType.IntType })) { entry ->
-            val args = entry.arguments!!
-            val position = ReadingPosition(args.getString("book")!!, args.getInt("chapter"), args.getInt("verse"))
-            val book = books.first { it.id == position.bookId }
+            val args = entry.arguments
+            val position = ReadingPosition(args?.getString("book").orEmpty(), args?.getInt("chapter") ?: 1, args?.getInt("verse") ?: 1)
+            val book = books.firstOrNull { it.id == position.bookId }
+            if (book == null) { Message("Footnotes unavailable."); return@composable }
             StudyNotesScreen(book, position, studyRepository, textSize, keepAwake, activity, onLink = { link ->
                 val target = studyPosition(link.url, books)
                 if (target != null) navigation.navigate("reader/${target.bookId}/${target.chapter}/${target.verse}/false")
@@ -242,9 +283,10 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
         }
         composable("share/{book}/{chapter}/{verse}", arguments = listOf(
             navArgument("chapter") { type = NavType.IntType }, navArgument("verse") { type = NavType.IntType })) { entry ->
-            val args = entry.arguments!!
-            val position = ReadingPosition(args.getString("book")!!, args.getInt("chapter"), args.getInt("verse"))
-            val book = books.first { it.id == position.bookId }
+            val args = entry.arguments
+            val position = ReadingPosition(args?.getString("book").orEmpty(), args?.getInt("chapter") ?: 1, args?.getInt("verse") ?: 1)
+            val book = books.firstOrNull { it.id == position.bookId }
+            if (book == null) { Message("Verse link unavailable."); return@composable }
             VerseHandoff(book, position) { navigation.navigate("share-help") }
         }
         composable("share-help") {
@@ -272,22 +314,27 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
             }
         }
         composable("lesson/{id}") { entry ->
-            lessons.firstOrNull { it.id == entry.arguments!!.getString("id") }?.let { lesson ->
+            val lesson = lessons.firstOrNull { it.id == entry.arguments?.getString("id") }
+            if (lesson != null) {
                 LessonOverview(lesson, books, today, refreshing, refreshError,
                     onGroup = { navigation.navigate("lesson-chapters/${lesson.id}/$it?parent=lesson") },
                     onLesson = { navigation.navigate("lesson-text/${lesson.id}") },
                     onWeeks = { navigation.navigate("lesson-years") }, onRefresh = { refreshCalendar(lesson.year) })
+            } else if (lessonsLoading) {
+                Message("Opening lesson…")
+            } else {
+                Message("Lesson unavailable.")
             }
         }
         composable("lesson-years") {
             val years = lessons.map { it.year }.distinct().sorted()
-            if (years.isEmpty()) Message("Connect to refresh the calendar.")
+            if (years.isEmpty()) Message(if (lessonsLoading) "Opening lessons…" else "Connect to refresh the calendar.")
             else Wheel("YEAR", years.map { "$it" }, years.indexOf(current?.year ?: today.year).coerceAtLeast(0), "Choose week") {
                 navigation.navigate("lesson-weeks/${years[it]}")
             }
         }
         composable("lesson-weeks/{year}", arguments = listOf(navArgument("year") { type = NavType.IntType })) { entry ->
-            val year = entry.arguments!!.getInt("year")
+            val year = entry.arguments?.getInt("year") ?: today.year
             val weeks = lessons.filter { it.year == year }
             WatchList(initialCenterItem = weeks.indexOfFirst { it.id == current?.id }.coerceAtLeast(0) + 1) {
                 item { Heading("COME, FOLLOW ME", "$year") }
@@ -296,18 +343,31 @@ private fun ScriptureApp(books: List<Book>, repository: ScriptureRepository, les
         }
         composable("lesson-chapters/{id}/{group}?parent={parent}", arguments = listOf(
             navArgument("group") { type = NavType.IntType }, navArgument("parent") { defaultValue = "cfm" })) { entry ->
-            val lesson = lessons.first { it.id == entry.arguments!!.getString("id") }
-            val group = lesson.groups[entry.arguments!!.getInt("group")]
-            val book = books.first { it.id == group.bookId }
-            val parent = if (entry.arguments!!.getString("parent") == "cfm") "cfm" else "lesson/{id}"
+            val lesson = lessons.firstOrNull { it.id == entry.arguments?.getString("id") }
+            if (lesson == null) {
+                Message(if (lessonsLoading) "Opening lesson…" else "Lesson reading unavailable.")
+                return@composable
+            }
+            val group = lesson.groups.getOrNull(entry.arguments?.getInt("group") ?: -1)
+            val book = group?.let { g -> books.firstOrNull { it.id == g.bookId } }
+            if (group == null || book == null || group.chapters.isEmpty()) {
+                Message("Lesson reading unavailable.")
+                return@composable
+            }
+            val parent = if (entry.arguments?.getString("parent") == "cfm") "cfm" else "lesson/{id}"
             Wheel("CHAPTER", group.chapters.map { "$it" }, 0, "Read", book.name) {
                 open(ReadingPosition(book.id, group.chapters[it], 1, itemIndex = 0), parent = parent)
             }
         }
         composable("lesson-text/{id}") { entry ->
-            lessons.firstOrNull { it.id == entry.arguments!!.getString("id") }?.let { lesson ->
+            val lesson = lessons.firstOrNull { it.id == entry.arguments?.getString("id") }
+            if (lesson != null) {
                 OfficialLessonReader(lesson, lessonRepository, store, textSize, keepAwake, activity,
                     onSettings = { navigation.navigate("settings") })
+            } else if (lessonsLoading) {
+                Message("Opening lesson…")
+            } else {
+                Message("Lesson unavailable.")
             }
         }
         composable("settings") {
@@ -433,7 +493,9 @@ private fun Reader(book: Book, initial: ReadingPosition, repository: ScriptureRe
     var chapter by remember(book.id, initial.chapter) { mutableStateOf<Chapter?>(null) }
     var failed by remember(book.id, initial.chapter) { mutableStateOf(false) }
     LaunchedEffect(book.id, initial.chapter) {
-        try { chapter = repository.chapter(book, initial.chapter) } catch (_: Exception) { failed = true }
+        try { chapter = repository.chapter(book, initial.chapter) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (_: Exception) { failed = true }
     }
     DisposableEffect(keepAwake) {
         if (keepAwake) activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

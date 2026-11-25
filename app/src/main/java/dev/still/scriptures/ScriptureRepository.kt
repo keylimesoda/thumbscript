@@ -7,25 +7,33 @@ import org.json.JSONArray
 
 class ScriptureRepository(context: Context) {
     private val assets = context.applicationContext.assets
-    private var cachedId: String? = null
-    private var cachedChapters: JSONArray? = null
+    @Volatile private var cachedBook: Pair<String, JSONArray>? = null
 
-    suspend fun catalog(): List<Book> = withContext(Dispatchers.IO) {
-        val array = JSONArray(assets.open("scriptures/catalog.json").bufferedReader().use { it.readText() })
-        List(array.length()) { index ->
-            val item = array.getJSONObject(index)
-            val counts = item.getJSONArray("verseCounts")
-            Book(item.getString("id"), item.getString("name"), item.getString("volume"),
-                List(counts.length()) { counts.getInt(it) })
+    fun cachedCatalog(): List<Book>? = processCatalog
+
+    suspend fun catalog(): List<Book> = processCatalog ?: withContext(Dispatchers.IO) {
+        processCatalog ?: run {
+            val array = JSONArray(assets.open("scriptures/catalog.json").bufferedReader().use { it.readText() })
+            List(array.length()) { index ->
+                val item = array.getJSONObject(index)
+                val counts = item.getJSONArray("verseCounts")
+                Book(item.getString("id"), item.getString("name"), item.getString("volume"),
+                    List(counts.length()) { counts.getInt(it) })
+            }.also { processCatalog = it }
         }
     }
 
     suspend fun chapter(book: Book, number: Int): Chapter = withContext(Dispatchers.IO) {
-        val chapters = if (cachedId == book.id) cachedChapters!! else {
+        val cached = cachedBook
+        val chapters = if (cached != null && cached.first == book.id) cached.second else {
             JSONArray(assets.open("scriptures/${book.id}.json").bufferedReader().use { it.readText() })
-                .also { cachedId = book.id; cachedChapters = it }
+                .also { cachedBook = book.id to it }
         }
         val verses = chapters.getJSONArray(number - 1)
         Chapter(book, number, List(verses.length()) { verses.getString(it) })
+    }
+
+    companion object {
+        @Volatile private var processCatalog: List<Book>? = null
     }
 }

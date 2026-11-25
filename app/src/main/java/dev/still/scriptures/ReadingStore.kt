@@ -4,7 +4,8 @@ import android.content.Context
 import org.json.JSONArray
 
 class ReadingStore(context: Context) {
-    private val preferences = context.getSharedPreferences("reading", Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val preferences by lazy { appContext.getSharedPreferences("reading", Context.MODE_PRIVATE) }
     fun savedVerses(): List<ReadingPosition> = runCatching {
         val array = JSONArray(preferences.getString("savedVerses", "[]"))
         List(array.length()) { array.optString(it) }.distinct().mapNotNull(::parseVerseKey)

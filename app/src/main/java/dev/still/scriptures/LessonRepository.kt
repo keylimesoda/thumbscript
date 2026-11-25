@@ -4,6 +4,8 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.util.AtomicFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -15,12 +17,14 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDate
 
-class LessonRepository(private val context: Context) {
-    private val directory = File(context.filesDir, "lessons").apply { mkdirs() }
-    private val mutex = Mutex()
-    private val preferences = context.getSharedPreferences("lesson-updates", 0)
-    private var highlights: List<LessonVerse> = emptyList()
-    private var bundled: List<Lesson> = emptyList()
+class LessonRepository(context: Context) {
+    private val context = context.applicationContext
+    private val directory by lazy { File(this.context.filesDir, "lessons").apply { mkdirs() } }
+    private val refreshMutex = Mutex()
+    private val lessonMutex = Mutex()
+    private val preferences by lazy { this.context.getSharedPreferences("lesson-updates", Context.MODE_PRIVATE) }
+    @Volatile private var highlights: List<LessonVerse> = emptyList()
+    @Volatile private var bundled: List<Lesson> = emptyList()
 
     suspend fun load(): List<Lesson> = withContext(Dispatchers.IO) {
         bundled = decode(context.assets.open("lessons/calendar.json").bufferedReader().use { it.readText() })
@@ -42,7 +46,7 @@ class LessonRepository(private val context: Context) {
     fun lastChecked(year: Int): Long = preferences.getLong("checked-$year", 0L)
 
     suspend fun refresh(year: Int, books: List<Book>): List<Lesson> = withContext(Dispatchers.IO) {
-        mutex.withLock {
+        refreshMutex.withLock {
             // Limit retries even if a publisher/network request fails. Manual refresh remains available.
             preferences.edit().putLong("checked-$year", System.currentTimeMillis()).apply()
             val cycle = listOf("old-testament", "new-testament", "book-of-mormon", "doctrine-and-covenants")
@@ -59,8 +63,12 @@ class LessonRepository(private val context: Context) {
     }
 
     suspend fun lessonText(lesson: Lesson, force: Boolean = false): List<LessonBlock> = withContext(Dispatchers.IO) {
-        mutex.withLock {
-            val file = File(directory, "text-${lesson.id}.json")
+        val file = File(directory, "text-${lesson.id}.json")
+        if (!force && file.exists()) {
+            val cached = runCatching { decodeBlocks(file.readText()) }.getOrNull()
+            if (!cached.isNullOrEmpty()) { file.setLastModified(System.currentTimeMillis()); return@withContext cached }
+        }
+        lessonMutex.withLock {
             if (!force && file.exists()) {
                 val cached = runCatching { decodeBlocks(file.readText()) }.getOrNull()
                 if (!cached.isNullOrEmpty()) { file.setLastModified(System.currentTimeMillis()); return@withLock cached }
@@ -80,11 +88,12 @@ class LessonRepository(private val context: Context) {
         }
     }
 
-    private fun download(url: String): String {
+    private suspend fun download(url: String): String {
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 8_000
         connection.readTimeout = 8_000
         connection.setRequestProperty("User-Agent", "StillScriptures/0.2 (personal Wear OS scripture study)")
+        val cancelHandle = currentCoroutineContext().job.invokeOnCompletion { if (it != null) runCatching { connection.disconnect() } }
         try {
             require(connection.responseCode in 200..299) { "Unable to reach the official lesson source." }
             require(connection.contentLengthLong <= 2_000_000) { "The lesson download was too large." }
@@ -102,7 +111,10 @@ class LessonRepository(private val context: Context) {
                 output.toByteArray()
             }
             return bytes.toString(Charsets.UTF_8)
-        } finally { connection.disconnect() }
+        } finally {
+            cancelHandle.dispose()
+            connection.disconnect()
+        }
     }
     private fun decodeBlocks(text: String): List<LessonBlock> {
         val array = JSONArray(text)

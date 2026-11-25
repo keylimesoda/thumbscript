@@ -3,6 +3,8 @@ package dev.still.scriptures
 import android.content.Context
 import android.util.AtomicFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -21,7 +23,8 @@ data class ChapterStudy(val summary: String, val notes: List<StudyNote>, val sou
 /** Official study helps are downloaded only on an explicit overview/footnotes request.
  * They remain in private app storage, never in the APK or public source assets. */
 class StudyRepository(context: Context) {
-    private val directory = File(context.filesDir, "chapter-study").apply { mkdirs() }
+    private val appContext = context.applicationContext
+    private val directory by lazy { File(appContext.filesDir, "chapter-study").apply { mkdirs() } }
     internal val memory = androidx.compose.runtime.mutableStateMapOf<String, ChapterStudy>()
     private val mutex = Mutex()
     suspend fun cached(book: Book, chapter: Int): ChapterStudy? = withContext(Dispatchers.IO) {
@@ -62,10 +65,11 @@ class StudyRepository(context: Context) {
             result
         }
     }
-    private fun download(url: String): String {
+    private suspend fun download(url: String): String {
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = 8_000; connection.readTimeout = 8_000
         connection.setRequestProperty("User-Agent", "StillScriptures/0.6 (personal scripture reading)")
+        val cancelHandle = currentCoroutineContext().job.invokeOnCompletion { if (it != null) runCatching { connection.disconnect() } }
         try {
             require(connection.responseCode in 200..299) { "Download failed" }
             val deadline = android.os.SystemClock.elapsedRealtime() + 20_000
@@ -81,7 +85,10 @@ class StudyRepository(context: Context) {
                 }
                 output.toString("UTF-8")
             }
-        } finally { connection.disconnect() }
+        } finally {
+            cancelHandle.dispose()
+            connection.disconnect()
+        }
     }
     private fun encode(study: ChapterStudy): String = JSONObject().apply {
         put("summary", study.summary); put("source", study.source); put("notices", study.notices)
