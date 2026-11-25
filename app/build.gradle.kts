@@ -49,7 +49,9 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             // Local builds retain the debug certificate when no release key is
             // configured. Tagged release workflows require the stable release key.
-            signingConfig = if (hasReleaseSigning) {
+            signingConfig = if (providers.environmentVariable("RELEASE_UNSIGNED").orNull == "true") {
+                null // CI builds without a signing key; isolated job signs the APK.
+            } else if (hasReleaseSigning) {
                 signingConfigs.getByName("release")
             } else {
                 signingConfigs.getByName("debug")

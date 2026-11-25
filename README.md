@@ -132,7 +132,12 @@ for its account sync. A portable backup of watch saves remains future work.
 
 ## Install
 
-Automated signed GitHub APK publishing and one-time signing-key setup are documented in [`docs/RELEASING.md`](docs/RELEASING.md).
+Future signed APK publication requires a manual workflow dispatch from protected
+`main` with an exact version tag whose commit is reviewed on `main`; pushing a
+tag alone does not publish. Signing/publishing approvals and a verified public
+signer fingerprint are also required. The workflow fails closed if the configured
+key differs from the public v0.6.1 certificate. Owner setup and signing migration
+requirements are documented in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 Download the optimized **release APK** from [the latest preview](https://github.com/keylimesoda/thumbscript/releases/tag/v0.6.1).
 Enable Developer options and Wireless debugging on the watch; keep it and your
